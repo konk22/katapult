@@ -22,10 +22,8 @@ compatibility will be updated over time.
 Katapult also uses Klipper's build system.  The build is configured
 with menuconfig.  The steps to fetch and build are as follows:
 ```
-git clone https://github.com/Arksine/katapult
+git clone https://github.com/konk22/katapult
 cd katapult
-make menuconfig
-make
 ```
 
 The menuconfig will present the following options:
@@ -102,7 +100,7 @@ with Katapult again.
    to query the bootloader for the UUID:
 
    ```
-   flashtool.py -i can0 -q
+   flashtool.py -i can0 -msuinfo
    ```
 
    **NOTE: A query should only be performed when a single can node is on
@@ -148,6 +146,9 @@ options:
   -u <uuid>, --uuid <uuid>
                         Can device uuid
   -q, --query           Query Bootloader Device IDs (CANBus only)
+  -msuinfo, -I, --msu-info
+                        Can be used instead of the -q key
+                        Works similarly to the -q key. It also returns the firmware version and microcontroller model.
   -v, --verbose         Enable verbose responses
   -r, --request-bootloader
                         Requests the bootloader and exits
