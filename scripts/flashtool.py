@@ -270,8 +270,13 @@ class CanFlasher:
         self.node.write(msg)
         self.primed = True
 
-    async def connect_btl(self) -> None:
-        output_line("Attempting to connect to bootloader")
+    async def connect_btl(
+        self,
+        emit_output: bool = True,
+        verify_klipper_mcu: bool = True
+    ) -> Dict[str, Any]:
+        if emit_output:
+            output_line("Attempting to connect to bootloader")
         ret = await self.send_command('CONNECT')
         pinfo = ret[:12]
         mcu_info = ret[12:]
@@ -293,15 +298,23 @@ class CanFlasher:
                 output_line("Katapult build not reporting software version!")
         else:
             mcu_type = mcu_info.decode()
-        output_line(
-            f"Katapult Connected\n"
-            f"Software Version: {self.software_version}\n"
-            f"Protocol Version: {proto_version_str}\n"
-            f"Block Size: {self.block_size} bytes\n"
-            f"Application Start: 0x{self.app_start_addr:4X}\n"
-            f"MCU type: {mcu_type}"
-        )
-        if self.klipper_dict is not None:
+        device_info = {
+            "software_version": self.software_version,
+            "protocol_version": proto_version_str,
+            "block_size": self.block_size,
+            "app_start_addr": self.app_start_addr,
+            "mcu_type": mcu_type
+        }
+        if emit_output:
+            output_line(
+                f"Katapult Connected\n"
+                f"Software Version: {self.software_version}\n"
+                f"Protocol Version: {proto_version_str}\n"
+                f"Block Size: {self.block_size} bytes\n"
+                f"Application Start: 0x{self.app_start_addr:4X}\n"
+                f"MCU type: {mcu_type}"
+            )
+        if self.klipper_dict is not None and verify_klipper_mcu:
             bin_mcu = self.klipper_dict.get("config", {}).get("MCU", "")
             if bin_mcu and bin_mcu != mcu_type:
                 raise FlashError(
@@ -310,6 +323,7 @@ class CanFlasher:
                     f"Katapult MCU: {mcu_type}\n"
                     f"Klipper Binary MCU: {bin_mcu}"
                 )
+        return device_info
 
     async def verify_canbus_uuid(self, uuid):
         output_line("Verifying canbus connection")
@@ -543,7 +557,10 @@ class BaseSocket:
     @property
     def is_flash_req(self) -> bool:
         return not (
-            self.is_bootloader_req or self.is_status_req or self.is_query
+            self.is_bootloader_req or
+            self.is_status_req or
+            self.is_query or
+            self.is_info
         )
 
     @property
@@ -557,6 +574,10 @@ class BaseSocket:
     @property
     def is_query(self) -> bool:
         return self._args.query
+
+    @property
+    def is_info(self) -> bool:
+        return getattr(self._args, "info", False)
 
     @property
     def is_usb_can_bridge(self) -> bool:
@@ -583,7 +604,7 @@ class CanSocket(BaseSocket):
         self._can_interface = args.interface
         self._can_bridge_path: pathlib.Path | None = None
         self._can_bridge_serial_path: pathlib.Path | None = None
-        if not self.is_query:
+        if not (self.is_query or self.is_info):
             if args.uuid is None:
                 raise FlashError(
                     "The 'uuid' option must be specified to flash a CAN device"
@@ -689,19 +710,25 @@ class CanSocket(BaseSocket):
                 break
         self.output_busy = False
 
-    def _jump_to_bootloader(self, uuid: int):
-        output_line("Sending bootloader jump command...")
+    def _jump_to_bootloader(self, uuid: int, verbose: bool = True):
+        if verbose:
+            output_line("Sending bootloader jump command...")
         plist = [(uuid >> ((5 - i) * 8)) & 0xFF for i in range(6)]
         plist.insert(0, KLIPPER_REBOOT_CMD)
         self.send(KLIPPER_ADMIN_ID, bytes(plist))
 
-    async def _query_uuids(self) -> List[int]:
-        output_line("Checking for Katapult nodes...")
+    async def _query_uuids(
+        self,
+        log_detection: bool = True
+    ) -> List[Dict[str, Any]]:
+        if log_detection:
+            output_line("Checking for Katapult nodes...")
         payload = bytes([CANBUS_CMD_QUERY_UNASSIGNED])
         self.admin_node.write(payload)
         curtime = self._loop.time()
         endtime = curtime + 2.
-        self.uuids: List[int] = []
+        detections: List[Dict[str, Any]] = []
+        seen: set[int] = set()
         while curtime < endtime:
             timeout = max(.1, endtime - curtime)
             try:
@@ -720,14 +747,18 @@ class CanSocket(BaseSocket):
             if len(resp) > 7:
                 app = app_names.get(resp[7], "Unknown")
             data = resp[1:7]
-            output_line(f"Detected UUID: {data.hex()}, Application: {app}")
+            if log_detection:
+                output_line(f"Detected UUID: {data.hex()}, Application: {app}")
             uuid = sum([v << ((5 - i) * 8) for i, v in enumerate(data)])
-            if uuid not in self.uuids and app == "Katapult":
-                self.uuids.append(uuid)
-        return self.uuids
+            if uuid in seen:
+                continue
+            seen.add(uuid)
+            detections.append({"uuid": uuid, "application": app})
+        return detections
 
-    def _reset_nodes(self) -> None:
-        output_line("Resetting all bootloader node IDs...")
+    def _reset_nodes(self, silent: bool = False) -> None:
+        if not silent:
+            output_line("Resetting all bootloader node IDs...")
         payload = bytes([CANBUS_CMD_CLEAR_NODE_ID])
         self.admin_node.write(payload)
 
@@ -743,6 +774,91 @@ class CanSocket(BaseSocket):
         node = CanNode(decoded_id, self)
         self.nodes[decoded_id + 1] = node
         return node
+
+    async def _collect_device_info(
+        self,
+        detections: List[Dict[str, Any]]
+    ) -> None:
+        if not detections:
+            output_line("No CAN nodes detected")
+            return
+        output_line("Collecting extended device information...")
+        katapult_found = False
+        for entry in detections:
+            uuid = entry["uuid"]
+            node_summary: Dict[str, Any] = {
+                "uuid": uuid,
+                "application": entry.get("application", "Unknown")
+            }
+            if node_summary["application"] != "Katapult":
+                node_summary["note"] = (
+                    "Device is running Klipper; reboot to Katapult to read MCU info."
+                )
+                self._print_device_info(node_summary)
+                output_line("")
+                continue
+            katapult_found = True
+            node = self._set_node_id(uuid)
+            flasher = CanFlasher(node, self._fw_path)
+            await asyncio.sleep(.2)
+            try:
+                info = await flasher.connect_btl(
+                    emit_output=False,
+                    verify_klipper_mcu=False
+                )
+            except FlashError as err:
+                node_summary["note"] = (
+                    f"Failed to read device info: {err}"
+                )
+                self._print_device_info(node_summary)
+                output_line("")
+                continue
+            node_summary.update(info)
+            self._print_device_info(node_summary)
+            output_line("")
+            await asyncio.sleep(.1)
+        if not katapult_found:
+            output_line(
+                "No devices currently running Katapult bootloader; "
+                "only UUID and application data was reported."
+            )
+
+    async def _ensure_katapult_for_info(
+        self,
+        detections: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        need_boot = [d for d in detections if d["application"] != "Katapult"]
+        if not need_boot:
+            return detections
+        output_line("Requesting devices to reboot into Katapult...")
+        for entry in need_boot:
+            self._jump_to_bootloader(entry["uuid"], verbose=False)
+        refreshed: List[Dict[str, Any]] = detections
+        for attempt in range(3):
+            await asyncio.sleep(1.0)
+            self._reset_nodes(silent=True)
+            await asyncio.sleep(.3)
+            refreshed = await self._query_uuids(log_detection=False)
+            remaining = [d for d in refreshed if d["application"] != "Katapult"]
+            if not remaining:
+                break
+        return refreshed
+
+    def _print_device_info(self, info: Dict[str, Any]) -> None:
+        details = [
+            f"UUID: {info['uuid']:012x}",
+            f"  Application: {info.get('application', 'Unknown')}"
+        ]
+        if "mcu_type" in info:
+            details.extend([
+                f"  MCU: {info['mcu_type']}"
+            ])
+        else:
+            details.append("  MCU: unavailable (device not in Katapult)")
+        note = info.get("note")
+        if note:
+            details.append(f"  Note: {note}")
+        output_line("\n".join(details))
 
     def _search_canbus_bridge(self) -> None:
         can_intf = self._can_interface.lower()
@@ -828,10 +944,15 @@ class CanSocket(BaseSocket):
                 await asyncio.sleep(1.0)
             if self.is_bootloader_req:
                 return
-        self._reset_nodes()
+        self._reset_nodes(silent=self.is_info)
         await asyncio.sleep(.5)
-        if self.is_query:
-            await self._query_uuids()
+        if self.is_query or self.is_info:
+            detections = await self._query_uuids(
+                log_detection=not self.is_info
+            )
+            if self.is_info:
+                detections = await self._ensure_katapult_for_info(detections)
+                await self._collect_device_info(detections)
             return
         node = self._set_node_id(self._uuid)
         flasher = CanFlasher(node, self._fw_path)
@@ -882,6 +1003,10 @@ class SerialSocket(BaseSocket):
 
     @property
     def is_query(self) -> bool:
+        return False
+
+    @property
+    def is_info(self) -> bool:
         return False
 
     @property
@@ -1094,6 +1219,9 @@ class SerialSocket(BaseSocket):
 async def main(args: argparse.Namespace) -> int:
     if not args.verbose:
         logging.getLogger().setLevel(logging.ERROR)
+    if args.info and args.device is not None:
+        output_line("The -msuinfo option is only available when using CAN mode")
+        return 1
     iscan = args.device is None
     sock: CanSocket | SerialSocket | None = None
     try:
@@ -1117,6 +1245,8 @@ async def main(args: argparse.Namespace) -> int:
         return 1
     if sock.is_query:
         output_line("CANBus UUID Query Complete")
+    elif sock.is_info:
+        output_line("CANBus device information complete")
     elif sock.is_bootloader_req:
         output_line("Bootloader Request Complete")
     elif sock.is_status_req:
@@ -1152,6 +1282,10 @@ if __name__ == '__main__':
     parser.add_argument(
         "-q", "--query", action="store_true",
         help="Query available CAN UUIDs (CANBus Ony)"
+    )
+    parser.add_argument(
+        "-msuinfo", "-I", "--msu-info", action="store_true", dest="info",
+        help="Query CAN devices and print extended device information"
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
